@@ -44,7 +44,7 @@ from micropython import const
 
 try:
     # Only used for typing
-    from typing import Tuple
+    from typing import Tuple, List
     from busio import I2C
 except ImportError:
     pass
@@ -103,6 +103,8 @@ _APDS9960_GFIFO_U = const(0xFC)
 # APDS9960_GFIFO_L    = const(0xFE)
 # APDS9960_GFIFO_R    = const(0xFF)
 
+_GESTURE_NAMES = ["None", "Up", "Down", "Left", "Right"]
+_CYCLE_TIME = 0.00278  # Sensor internal cycle time in milliseconds
 
 # pylint: disable-msg=too-many-instance-attributes, too-many-public-methods
 class APDS9960:
@@ -148,7 +150,10 @@ class APDS9960:
         address: int = 0x39,
         rotation: int = 0,
         reset: bool = True,
-        set_defaults: bool = True
+        set_defaults: bool = True,
+        max_gesture_dataframe: int = 256,
+        data_stream_persist_cycles: int = 5,
+        data_stream_low_threshold: int = 30
     ):
 
         self.buf129 = None
@@ -167,16 +172,20 @@ class APDS9960:
         if set_defaults:
             self.defaults()
 
-        self._reset_counts()
+        self._max_dataframe_size = max_gesture_dataframe
+        self._data_stream_low_threshold = data_stream_low_threshold
+        self._data_stream_persist_cycles = data_stream_persist_cycles
+        self._data_stream_persist_sleep = self._data_stream_persist_cycles * _CYCLE_TIME
 
     def defaults(self):
         """Apply sensible defaults to fit most use cases"""
-        self.proximity_interrupt_threshold = (20, 255, 5)
-        self.proximity_led_config = (7, 1, 0, 0)  # 8 pulses, 8us, 100mA, 1x
+        self.proximity_interrupt_threshold = (20, 150, 5)
+        self.proximity_led_config = (7, 1, 0, 0)  # 8 pulses, 8us, 100mA x1
         self.proximity_gain = 1
 
         self.gesture_engine_config = (5, 100, 2, 2)
-        self.gesture_led_config = (7, 1, 0, 0)  # 8 pulses, 8us, 100mA, 1x
+        self.gesture_led_config = (5, 2, 0, 2)  # 4 pulses, 32us, 100mA x2
+        self.gesture_fifo_threshold = 1
         self.gesture_gain = 1
 
     def reset(self):
@@ -184,7 +193,7 @@ class APDS9960:
         self.enable_proximity = False
         self.enable_proximity_interrupt = False
         self.proximity_interrupt_threshold = (0, 0, 0)
-        self.proximity_led_config = (0, 1, 0, 0)  # 1 pulse, 8us, 100mA, 1x
+        self.proximity_led_config = (0, 1, 0, 0)  # 1 pulse, 8us, 100mA x1
         self.proximity_gain = 0
 
         self.enable_gesture = False
@@ -192,7 +201,7 @@ class APDS9960:
         self.gmode = False
         self.clear_gesture_fifo()
         self.gesture_engine_config = (0, 0, 0, 0)
-        self.gesture_led_config = (0, 1, 0, 0)
+        self.gesture_led_config = (0, 1, 0, 0)  # 1 pulse, 8us, 100mA x1
         self.gesture_gain = 0
         self.gesture_fifo_threshold = 0
 
@@ -205,8 +214,6 @@ class APDS9960:
         time.sleep(0.010)
         self.enable = True
         time.sleep(0.010)
-
-        self._reset_counts()
 
     # Device Configuration
     device_id = UnaryStruct(_APDS9960_ID, "<B")
@@ -610,6 +617,9 @@ class APDS9960:
     """Color gain value"""
 
     color_interrupt = ROBit(_APDS9960_STATUS, 4)
+    """Asserted when color clear channel threshold is met or exceeded by sequential color results
+
+    Cleared by 'clear_color_interrupt' or 'clear_all_interrupts'"""
     # color_saturation_interrupt = ROBit(_APDS9960_STATUS, 7)
 
     def clear_color_interrupt(self) -> None:
@@ -621,7 +631,7 @@ class APDS9960:
         """Color data ready flag.  zero if not ready, 1 is ready"""
         return self.color_valid
 
-    # Gesture processing configuration
+    # Gesture processing rotation
     @property
     def rotation(self) -> int:
         """Gesture rotation offset. Acceptable values are 0, 90, 180, 270."""
@@ -634,106 +644,174 @@ class APDS9960:
         else:
             raise ValueError("Rotation value must be one of: 0, 90, 180, 270")
 
-    # Gesture processing globals
-    def _reset_counts(self) -> None:
-        """Reset internal gesture detection state"""
-        self._saw_down_start = 0
-        self._saw_up_start = 0
-        self._saw_left_start = 0
-        self._saw_right_start = 0
-
-    # Gesture processing
     def rotated_gesture(self, original_gesture: int) -> int:
         """Applies rotation offset to the given gesture direction and returns the result"""
         directions = [1, 4, 2, 3]
         new_index = (directions.index(original_gesture) + self._rotation // 90) % 4
         return directions[new_index]
 
-    def gesture(self) -> int:  # pylint: disable-msg=too-many-branches
-        """Returns gesture code if detected. =0 if no gesture detected
-        =1 if an UP, =2 if a DOWN, =3 if an LEFT, =4 if a RIGHT
-        """
-        # buffer to read of contents of device FIFO buffer
-        if not self.buf129:
-            self.buf129 = bytearray(129)
+    def gesture_string(self) -> str:
+        """Gather and process gesture data, returns string representing gesture direction"""
+        gesture_number = self.gesture()
 
-        buffer = self.buf129
-        buffer[0] = _APDS9960_GFIFO_U
-        if not self.gesture_valid:
-            return 0
+        return _GESTURE_NAMES[gesture_number]
 
-        time_mark = 0.0
-        gesture_received = 0
-        while True:
+    def gesture(self) -> int:
+        """Gather and process gesture data, returns int representing gesture direction
 
-            up_down_diff = 0
-            left_right_diff = 0
-            gesture_received = 0
-            time.sleep(0.030)  # 30 ms
+        0 = None, 1 = Up, 2 = Down, 3 = Left, 4 = Right"""
+        dataframe = self._get_gesture_data()
 
-            n_recs = self._gflvl
-            if n_recs:
+        if len(dataframe) > 0:
+            processed_gesture = self._process_gesture_data(dataframe)
+            if processed_gesture > 0:
+                return self.rotated_gesture(processed_gesture)
 
+        return 0
+
+    def _get_gesture_data(self) -> List[Tuple[int, int, int, int]]:
+        """Retrieves sequential gesture datasets from FIFO, if any are available"""
+        dataframe = []
+
+        # If we've already overflowed, clear out the stale FIFOs right away and wait for fresh data
+        if self._gfov:
+            self.clear_gesture_fifo()
+            while not self.gesture_interrupt:
+                time.sleep(0.001)
+
+        # Only start retrieval if gvalid and if there are datasets to retrieve
+        dataset_count = self._gflvl
+        if self.gesture_valid and dataset_count > 0:
+            if self.buf129 is None:
+                self.buf129 = bytearray(129)
+
+            # Stack new gesture datasets into our dataframe
+            # Also, keep stacking new datasets if they show up while we're reading in FIFO data
+            while True:
+                # Acquire all available data
+                dataset_count = self._gflvl
+                self.buf129[0] = _APDS9960_GFIFO_U
                 with self.i2c_device as i2c:
                     i2c.write_then_readinto(
-                        buffer,
-                        buffer,
+                        self.buf129,
+                        self.buf129,
                         out_end=1,
                         in_start=1,
-                        in_end=min(129, 1 + n_recs * 4),
+                        in_end=min(129, 1 + (dataset_count * 4)),
                     )
-                upp, down, left, right = buffer[1:5]
 
-                if abs(upp - down) > 13:
-                    up_down_diff = upp - down
+                idx = 0
+                # Unpack data stream into more usable U/D/L/R datasets
+                for i in range(dataset_count):
+                    rec = i + 1
+                    idx = 1 + ((rec - 1) * 4)
 
-                if abs(left - right) > 13:
-                    left_right_diff = left - right
+                    dataset_tuple = (
+                        self.buf129[idx],
+                        self.buf129[idx + 1],
+                        self.buf129[idx + 2],
+                        self.buf129[idx + 3],
+                    )
 
-                if up_down_diff != 0:
-                    if up_down_diff < 0:
-                        # either leading edge of down movement
-                        # or trailing edge of up movement
-                        if self._saw_up_start:
-                            gesture_received = 0x01  # up
-                        else:
-                            self._saw_down_start += 1
-                    elif up_down_diff > 0:
-                        # either leading edge of up movement
-                        # or trailing edge of down movement
-                        if self._saw_down_start:
-                            gesture_received = 0x02  # down
-                        else:
-                            self._saw_up_start += 1
+                    # Drop fully-saturated and fully-zero to conserve memory
+                    # Low-pass filter to remove potentially spurious very-low-count entries
+                    if self._filter_dataset(
+                        dataset_tuple, self._data_stream_low_threshold
+                    ):
+                        dataframe.append(dataset_tuple)
 
-                if left_right_diff != 0:
-                    if left_right_diff < 0:
-                        # either leading edge of right movement
-                        # trailing edge of left movement
-                        if self._saw_left_start:
-                            gesture_received = 0x03  # left
-                        else:
-                            self._saw_right_start += 1
-                    elif left_right_diff > 0:
-                        # either leading edge of left movement
-                        # trailing edge of right movement
-                        if self._saw_right_start:
-                            gesture_received = 0x04  # right
-                        else:
-                            self._saw_left_start += 1
+                # Break out of our loop if we have way too many datasets
+                if len(dataframe) > self._max_dataframe_size:
+                    # print("Get: Halting, gflvl: {}, len: {}".format(self._gflvl, len(dataframe)))
+                    break
 
-                # saw a leading or trailing edge; start timer
-                if up_down_diff or left_right_diff:
-                    time_mark = time.monotonic()
+                # Wait a very short time to see if new FIFO data has arrived before we drop out
+                time.sleep(self._data_stream_persist_sleep)
+                if self._gflvl == 0:
+                    # print("Get: Halting, gflvl: {}, len: {}".format(self._gflvl, len(dataframe)))
+                    break
+                # else:
+                # print("Get: Continuing, gflvl: {}, len: {}".format(self._gflvl, len(dataframe)))
+        return dataframe
 
-            # finished when a gesture is detected or ran out of time (300ms)
-            if gesture_received or time.monotonic() - time_mark > 0.300:
-                self._reset_counts()
-                break
-        if gesture_received != 0:
-            if self._rotation != 0:
-                return self.rotated_gesture(gesture_received)
-        return gesture_received
+    # pylint: disable-msg=no-else-return, too-many-return-statements, too-many-branches
+    def _process_gesture_data(self, dataframe: List[Tuple[int, int, int, int]]) -> int:
+        _gesture_delta_threshold = 30
+
+        first_dataset = dataframe[0]
+        last_dataset = dataframe[len(dataframe) - 1]
+
+        # print("f: {}, l: {}".format(first_dataset, last_dataset))
+
+        ratios_first = self._dataset_ratios(first_dataset)
+        ratios_last = self._dataset_ratios(last_dataset)
+
+        delta_ud = ratios_last[0] - ratios_first[0]
+        delta_lr = ratios_last[1] - ratios_first[1]
+
+        state_ud = 0
+        state_lr = 0
+
+        if delta_ud >= _gesture_delta_threshold:
+            state_ud = 1
+        elif delta_ud <= -_gesture_delta_threshold:
+            state_ud = -1
+
+        if delta_lr >= _gesture_delta_threshold:
+            state_lr = 1
+        elif delta_lr <= -_gesture_delta_threshold:
+            state_lr = -1
+
+        # Easy cases
+        if state_ud == -1 and state_lr == 0:
+            return 1
+        elif state_ud == 1 and state_lr == 0:
+            return 2
+        elif state_ud == 0 and state_lr == -1:
+            return 3
+        elif state_ud == 0 and state_lr == 1:
+            return 4
+
+        # Not so easy cases
+        if state_ud == -1 and state_lr == 1:
+            if abs(delta_ud) > abs(delta_lr):
+                return 1
+            else:
+                return 4
+        elif state_ud == 1 and state_lr == -1:
+            if abs(delta_ud) > abs(delta_lr):
+                return 2
+            else:
+                return 3
+        elif state_ud == -1 and state_lr == -1:
+            if abs(delta_ud) > abs(delta_lr):
+                return 1
+            else:
+                return 3
+        elif state_ud == 1 and state_lr == 1:
+            if abs(delta_ud) > abs(delta_lr):
+                return 2
+            else:
+                return 3
+
+        return 0
+
+    @staticmethod
+    def _dataset_ratios(dataset: Tuple[int, int, int, int]) -> Tuple[int, int]:
+        ratio_ud = ((dataset[0] - dataset[1]) * 100) // (dataset[0] + dataset[1])
+        ratio_lr = ((dataset[2] - dataset[3]) * 100) // (dataset[2] + dataset[3])
+        return ratio_ud, ratio_lr
+
+    @staticmethod
+    def _filter_dataset(dataset: Tuple[int, int, int, int], low_thresh: int) -> bool:
+        if all(val == 255 for val in dataset):
+            return False
+        elif all(val == 0 for val in dataset):
+            return False
+        elif not all(val >= low_thresh for val in dataset):
+            return False
+        else:
+            return True
 
     # method for reading and writing to I2C
     def _writecmdonly(self, command: int) -> None:
