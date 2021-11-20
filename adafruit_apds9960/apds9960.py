@@ -449,7 +449,7 @@ class APDS9960:
         Proximity entry threshold (0-255): Minimum proximity value for gesture engine entrance
         Exit threshold (0-255): Minimum proximity value for gesture engine loop persistence
         Persistence (0-3): Number of out-of-thresold loops to continue recording gesture data
-            0 = 1 cycle, 1 = 2 cycles, 2 = 4 cycles, 3 = 7 cycles
+        0 = 1 cycle, 1 = 2 cycles, 2 = 4 cycles, 3 = 7 cycles
         Wait time (0-7): Number of 2.78ms cycles to wait between gesture 1.39 ms engine loops"""
         return (self._gpenth, self._gexth, self._gpers, self._gwtime)
 
