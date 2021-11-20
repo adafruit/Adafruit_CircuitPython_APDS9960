@@ -113,9 +113,12 @@ class APDS9960:
 
     :param ~busio.I2C i2c: The I2C bus the ASDS9960 is connected to
     :param int address: The I2C device address. Defaults to :const:`0x39`
-    :param int integration_time: integration time. Defaults to :const:`0x01`
-    :param int gain: Device gain. Defaults to :const:`0x01`
-    :param int rotation: rotation of the device. Defaults to :const:`0`
+    :param int rotation: Rotation of the device. Defaults to :const:`0`
+    :param bool reset: If true, resets device registers during init. Defaults to :const:`True`
+    :param bool set_defaults: If true, set sensible defaults during init. Defaults to :const:`True`
+    :param int gesture_max_dataframes: Maxmium size gesture dataframe. Defaults to :const:`64`
+    :param int gesture_persist_cycles: Cycles to wait for new gesture data. Defaults to :const:`5`
+    :param int gesture_high_pass_threshold: Minimum value for gesture data. Defaults to :const:`30`
 
 
     **Quickstart: Importing and using the APDS9960**
@@ -135,10 +138,11 @@ class APDS9960:
             i2c = board.I2C()   # uses board.SCL and board.SDA
             apds = APDS9960(i2c)
 
-        Now you have access to the :attr:`sensor.proximity` attribute
+        Now you have access to the :attr:`proximity_enable` and :attr:`sensor.proximity` attributes
 
         .. code-block:: python
 
+            apds.proximity_enable = True
             proximity = apds.proximity
 
     """
@@ -151,13 +155,13 @@ class APDS9960:
         rotation: int = 0,
         reset: bool = True,
         set_defaults: bool = True,
-        max_gesture_dataframe: int = 256,
-        data_stream_persist_cycles: int = 5,
-        data_stream_low_threshold: int = 30
+        gesture_max_dataframes: int = 64,
+        gesture_persist_cycles: int = 5,
+        gesture_high_pass_threshold: int = 30
     ):
 
-        self.buf129 = None
-        self.buf2 = bytearray(2)
+        self.gesture_buffer = None
+        self.msg_buffer = bytearray(2)
 
         self.i2c_device = I2CDevice(i2c, address)
 
@@ -172,18 +176,20 @@ class APDS9960:
         if set_defaults:
             self.defaults()
 
-        self._max_dataframe_size = max_gesture_dataframe
-        self._data_stream_low_threshold = data_stream_low_threshold
-        self._data_stream_persist_cycles = data_stream_persist_cycles
-        self._data_stream_persist_sleep = self._data_stream_persist_cycles * _CYCLE_TIME
+        self._gesture_max_dataframes = gesture_max_dataframes
+        self._data_gesture_persist_cycles = gesture_persist_cycles
+        self._data_gesture_high_pass_threshold = gesture_high_pass_threshold
+        self._data_stream_persist_sleep = (
+            self._data_gesture_high_pass_threshold * _CYCLE_TIME
+        )
 
     def defaults(self):
         """Apply sensible defaults to fit most use cases"""
-        self.proximity_interrupt_threshold = (20, 150, 5)
+        self.proximity_interrupt_threshold = (0, 150, 5)  # 0 near, 150 far, 5 cycles
         self.proximity_led_config = (7, 1, 0, 0)  # 8 pulses, 8us, 100mA x1
         self.proximity_gain = 1
 
-        self.gesture_engine_config = (5, 100, 2, 2)
+        self.gesture_engine_config = (5, 100, 2, 2)  # ent: 5, ex: 100, per: 2, wait: 2
         self.gesture_led_config = (5, 2, 0, 2)  # 4 pulses, 32us, 100mA x2
         self.gesture_fifo_threshold = 1
         self.gesture_gain = 1
@@ -192,7 +198,7 @@ class APDS9960:
         """Reset device registers to power-on defaults"""
         self.enable_proximity = False
         self.enable_proximity_interrupt = False
-        self.proximity_interrupt_threshold = (0, 0, 0)
+        self.proximity_interrupt_threshold = (0, 0, 0)  # 0 near, 0 far, 0 cycles
         self.proximity_led_config = (0, 1, 0, 0)  # 1 pulse, 8us, 100mA x1
         self.proximity_gain = 0
 
@@ -200,7 +206,7 @@ class APDS9960:
         self.enable_gesture_interrupt = False
         self.gmode = False
         self.clear_gesture_fifo()
-        self.gesture_engine_config = (0, 0, 0, 0)
+        self.gesture_engine_config = (0, 0, 0, 0)  # ent: 0, ex: 0, per: 0, wait: 0
         self.gesture_led_config = (0, 1, 0, 0)  # 1 pulse, 8us, 100mA x1
         self.gesture_gain = 0
         self.gesture_fifo_threshold = 0
@@ -650,16 +656,23 @@ class APDS9960:
         new_index = (directions.index(original_gesture) + self._rotation // 90) % 4
         return directions[new_index]
 
-    def gesture_string(self) -> str:
+    def gesture_string(self, blocking=False) -> str:
         """Gather and process gesture data, returns string representing gesture direction"""
-        gesture_number = self.gesture()
+        gesture_number = self.gesture(blocking)
 
         return _GESTURE_NAMES[gesture_number]
 
-    def gesture(self) -> int:
+    def gesture(self, blocking=False) -> int:
         """Gather and process gesture data, returns int representing gesture direction
 
-        0 = None, 1 = Up, 2 = Down, 3 = Left, 4 = Right"""
+        Blocking: If true, wait for 'gesture_interrupt' before reading in gesture data.
+
+        Return: 0 = None, 1 = Up, 2 = Down, 3 = Left, 4 = Right"""
+        if blocking:
+            # If we want to block until gesture data comes in we'll wait on our FIFO threshold
+            while not self.gesture_interrupt:
+                pass
+
         dataframe = self._get_gesture_data()
 
         if len(dataframe) > 0:
@@ -673,55 +686,60 @@ class APDS9960:
         """Retrieves sequential gesture datasets from FIFO, if any are available"""
         dataframe = []
 
-        # If we've already overflowed, clear out the stale FIFOs right away and wait for fresh data
+        # If FIFOs have overflowed we're already way too late, so clear those FIFOs and wait
         if self._gfov:
             self.clear_gesture_fifo()
-            while not self.gesture_interrupt:
-                time.sleep(0.001)
+            # Don't wait forever though, just enough to see if a gesture is happening
+            wait_cycles = 0
+            while not self.gesture_interrupt and wait_cycles <= 30:
+                time.sleep(_CYCLE_TIME)
+                wait_cycles += 1
 
-        # Only start retrieval if gvalid and if there are datasets to retrieve
+        # Only start retrieval if there are datasets to retrieve
         dataset_count = self._gflvl
-        if self.gesture_valid and dataset_count > 0:
-            if self.buf129 is None:
-                self.buf129 = bytearray(129)
+        if dataset_count > 0:
+            if self.gesture_buffer is None:
+                self.gesture_buffer = bytearray(129)
+
+            buffer = self.gesture_buffer
 
             # Stack new gesture datasets into our dataframe
             # Also, keep stacking new datasets if they show up while we're reading in FIFO data
             while True:
                 # Acquire all available data
                 dataset_count = self._gflvl
-                self.buf129[0] = _APDS9960_GFIFO_U
+                buffer[0] = _APDS9960_GFIFO_U
                 with self.i2c_device as i2c:
                     i2c.write_then_readinto(
-                        self.buf129,
-                        self.buf129,
+                        buffer,
+                        buffer,
                         out_end=1,
                         in_start=1,
                         in_end=min(129, 1 + (dataset_count * 4)),
                     )
 
                 idx = 0
-                # Unpack data stream into more usable U/D/L/R datasets
+                # Unpack data stream into more usable U/D/L/R dataset tuples
                 for i in range(dataset_count):
                     rec = i + 1
                     idx = 1 + ((rec - 1) * 4)
 
                     dataset_tuple = (
-                        self.buf129[idx],
-                        self.buf129[idx + 1],
-                        self.buf129[idx + 2],
-                        self.buf129[idx + 3],
+                        buffer[idx],
+                        buffer[idx + 1],
+                        buffer[idx + 2],
+                        buffer[idx + 3],
                     )
 
                     # Drop fully-saturated and fully-zero to conserve memory
                     # Low-pass filter to remove potentially spurious very-low-count entries
                     if self._filter_dataset(
-                        dataset_tuple, self._data_stream_low_threshold
+                        dataset_tuple, self._data_gesture_high_pass_threshold
                     ):
                         dataframe.append(dataset_tuple)
 
-                # Break out of our loop if we have way too many datasets
-                if len(dataframe) > self._max_dataframe_size:
+                # Break out of our loop ASAP if we have way too many datasets
+                if len(dataframe) > self._gesture_max_dataframes:
                     # print("Get: Halting, gflvl: {}, len: {}".format(self._gflvl, len(dataframe)))
                     break
 
@@ -736,12 +754,15 @@ class APDS9960:
 
     # pylint: disable-msg=no-else-return, too-many-return-statements, too-many-branches
     def _process_gesture_data(self, dataframe: List[Tuple[int, int, int, int]]) -> int:
+        """Processes gesture dataframes to determine gesture
+
+        This assumes that the dataframe has already been high-pass filtered"""
         _gesture_delta_threshold = 30
 
         first_dataset = dataframe[0]
         last_dataset = dataframe[len(dataframe) - 1]
 
-        # print("f: {}, l: {}".format(first_dataset, last_dataset))
+        # print("Process: f: {}, l: {}".format(first_dataset, last_dataset))
 
         ratios_first = self._dataset_ratios(first_dataset)
         ratios_last = self._dataset_ratios(last_dataset)
@@ -816,7 +837,7 @@ class APDS9960:
     # method for reading and writing to I2C
     def _writecmdonly(self, command: int) -> None:
         """Writes a command and 0 bytes of data to the I2C device"""
-        buf = self.buf2
+        buf = self.msg_buffer
         buf[0] = command
         with self.i2c_device as i2c:
             i2c.write(buf, end=1)
@@ -824,7 +845,7 @@ class APDS9960:
     def _color_data16(self, command: int) -> int:
         """Sends a command and reads 2 bytes of data from the I2C device
         The returned data is low byte first followed by high byte"""
-        buf = self.buf2
+        buf = self.msg_buffer
         buf[0] = command
         with self.i2c_device as i2c:
             i2c.write_then_readinto(buf, buf, out_end=1)
