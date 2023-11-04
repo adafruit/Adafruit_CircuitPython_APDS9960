@@ -183,8 +183,8 @@ class APDS9960:
 
         self.i2c_device = I2CDevice(i2c, _APDS9960_I2C_ADDRESS)
 
-        if self._read8(_APDS9960_ID) != _DEVICE_ID:
-            raise RuntimeError()
+        #if self._read8(_APDS9960_ID) != _DEVICE_ID:
+        #    raise RuntimeError()
 
         if reset:
             # Disable prox, gesture, and color engines
