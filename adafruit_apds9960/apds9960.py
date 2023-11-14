@@ -51,7 +51,7 @@ __repo__ = "https://github.com/adafruit/Adafruit_CircuitPython_APDS9960.git"
 
 # Only one address is possible for the APDS9960, no alternates are available
 _APDS9960_I2C_ADDRESS = const(0x39)
-_DEVICE_ID = const(0xAB)
+_DEVICE_IDS = (const(0xAB), const(0xA8))
 
 # APDS9960_RAM        = const(0x00)
 _APDS9960_ENABLE = const(0x80)
@@ -183,8 +183,8 @@ class APDS9960:
 
         self.i2c_device = I2CDevice(i2c, _APDS9960_I2C_ADDRESS)
 
-        #if self._read8(_APDS9960_ID) != _DEVICE_ID:
-        #    raise RuntimeError()
+        if self._read8(_APDS9960_ID) not in _DEVICE_IDS:
+            raise RuntimeError()
 
         if reset:
             # Disable prox, gesture, and color engines
