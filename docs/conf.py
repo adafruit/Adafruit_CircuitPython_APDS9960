@@ -22,13 +22,6 @@ extensions = [
     "sphinx.ext.viewcode",
 ]
 
-# Mock out micropython ourselves so that we can make const a lambda.
-import imp
-
-m = imp.new_module("micropython")
-m.const = lambda x: x
-sys.modules["micropython"] = m
-
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
     "BusDevice": (
