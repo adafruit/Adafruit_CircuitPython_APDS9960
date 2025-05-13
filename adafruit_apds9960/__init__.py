@@ -2,4 +2,4 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""common include for APDS9960 driver """
+"""common include for APDS9960 driver"""
