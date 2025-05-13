@@ -3,6 +3,7 @@
 
 import board
 import digitalio
+
 from adafruit_apds9960.apds9960 import APDS9960
 
 i2c = board.I2C()  # uses board.SCL and board.SDA

@@ -35,13 +35,16 @@ Implementation Notes
 
 * Adafruit's Bus Device library: https://github.com/adafruit/Adafruit_CircuitPython_BusDevice
 """
+
 import time
+
 from adafruit_bus_device.i2c_device import I2CDevice
 from micropython import const
 
 try:
     # Only used for typing
     from typing import Tuple
+
     from busio import I2C
 except ImportError:
     pass
@@ -127,7 +130,6 @@ _BIT_POS_GCONF2_GGAIN = const(5)
 _BIT_MASK_GCONF2_GGAIN = const(0x60)
 
 
-# pylint: disable-msg=too-many-instance-attributes
 class APDS9960:
     """
     Provide basic driver services for the APDS9960 breakout board
@@ -168,12 +170,7 @@ class APDS9960:
     """
 
     def __init__(
-        self,
-        i2c: I2C,
-        *,
-        rotation: int = 0,
-        reset: bool = True,
-        set_defaults: bool = True
+        self, i2c: I2C, *, rotation: int = 0, reset: bool = True, set_defaults: bool = True
     ):
         self.rotation = rotation
 
@@ -372,9 +369,7 @@ class APDS9960:
         persist = 4  # default 4
         if len(setting_tuple) > 2 and 0 <= setting_tuple[0] <= 15:
             persist = min(setting_tuple[2], 15)
-            self._set_bits(
-                _APDS9960_PERS, _BIT_POS_PERS_PPERS, _BIT_MASK_PERS_PPERS, persist
-            )
+            self._set_bits(_APDS9960_PERS, _BIT_POS_PERS_PPERS, _BIT_MASK_PERS_PPERS, persist)
 
     @property
     def proximity_gain(self) -> int:
@@ -390,15 +385,11 @@ class APDS9960:
            2, "4x", ""
            3, "8x", ""
         """
-        return self._get_bits(
-            _APDS9960_CONTROL, _BIT_POS_CONTROL_PGAIN, _BIT_MASK_CONTROL_PGAIN
-        )
+        return self._get_bits(_APDS9960_CONTROL, _BIT_POS_CONTROL_PGAIN, _BIT_MASK_CONTROL_PGAIN)
 
     @proximity_gain.setter
     def proximity_gain(self, value: int) -> None:
-        self._set_bits(
-            _APDS9960_CONTROL, _BIT_POS_CONTROL_PGAIN, _BIT_MASK_CONTROL_PGAIN, value
-        )
+        self._set_bits(_APDS9960_CONTROL, _BIT_POS_CONTROL_PGAIN, _BIT_MASK_CONTROL_PGAIN, value)
 
     def clear_interrupt(self) -> None:
         """Clears all non-gesture interrupts.
@@ -439,15 +430,11 @@ class APDS9960:
            2, "4x", "Driver Default"
            3, "8x", ""
         """
-        return self._get_bits(
-            _APDS9960_GCONF2, _BIT_POS_GCONF2_GGAIN, _BIT_MASK_GCONF2_GGAIN
-        )
+        return self._get_bits(_APDS9960_GCONF2, _BIT_POS_GCONF2_GGAIN, _BIT_MASK_GCONF2_GGAIN)
 
     @gesture_gain.setter
     def gesture_gain(self, value: int) -> None:
-        self._set_bits(
-            _APDS9960_GCONF2, _BIT_POS_GCONF2_GGAIN, _BIT_MASK_GCONF2_GGAIN, value
-        )
+        self._set_bits(_APDS9960_GCONF2, _BIT_POS_GCONF2_GGAIN, _BIT_MASK_GCONF2_GGAIN, value)
 
     @property
     def rotation(self) -> int:
@@ -471,7 +458,7 @@ class APDS9960:
 
     @rotation.setter
     def rotation(self, new_rotation: int) -> None:
-        if new_rotation in [0, 90, 180, 270]:
+        if new_rotation in {0, 90, 180, 270}:
             self._rotation = new_rotation
         else:
             raise ValueError("Rotation value must be one of: 0, 90, 180, 270")
@@ -522,15 +509,11 @@ class APDS9960:
            However, measuring the intensity and color temperature of ambient light through
            difusion glass or plastic is likely to require experimenting with a wide range of
            integration time and gain settings before useful data can be obtained."""
-        return self._get_bits(
-            _APDS9960_CONTROL, _BIT_POS_CONTROL_AGAIN, _BIT_MASK_CONTROL_AGAIN
-        )
+        return self._get_bits(_APDS9960_CONTROL, _BIT_POS_CONTROL_AGAIN, _BIT_MASK_CONTROL_AGAIN)
 
     @color_gain.setter
     def color_gain(self, value: int) -> None:
-        self._set_bits(
-            _APDS9960_CONTROL, _BIT_POS_CONTROL_AGAIN, _BIT_MASK_CONTROL_AGAIN, value
-        )
+        self._set_bits(_APDS9960_CONTROL, _BIT_POS_CONTROL_AGAIN, _BIT_MASK_CONTROL_AGAIN, value)
 
     @property
     def color_integration_time(self) -> int:
@@ -582,7 +565,6 @@ class APDS9960:
         return self._read8(_APDS9960_PDATA)
 
     ## GESTURE DETECTION
-    # pylint: disable-msg=too-many-branches,too-many-locals,too-many-statements
     def gesture(self) -> int:
         """Gesture sensor data.
 
@@ -641,20 +623,14 @@ class APDS9960:
             self._set_bit(_APDS9960_GCONF4, _BIT_MASK_GCONF4_GFIFO_CLR, True)
             wait_cycles = 0
             # Don't wait forever though, just enough to see if a gesture is happening
-            while (
-                not self._get_bit(_APDS9960_STATUS, _BIT_MASK_STATUS_GINT)
-                and wait_cycles <= 30
-            ):
+            while not self._get_bit(_APDS9960_STATUS, _BIT_MASK_STATUS_GINT) and wait_cycles <= 30:
                 time.sleep(0.003)
                 wait_cycles += 1
 
         # Only start retrieval if there are datasets to retrieve
         frame = []
         datasets_available = self._read8(_APDS9960_GFLVL)
-        if (
-            self._get_bit(_APDS9960_STATUS, _BIT_MASK_STATUS_GINT)
-            and datasets_available > 0
-        ):
+        if self._get_bit(_APDS9960_STATUS, _BIT_MASK_STATUS_GINT) and datasets_available > 0:
             if not self.buf129:
                 self.buf129 = bytearray(129)
 
