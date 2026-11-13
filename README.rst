@@ -172,6 +172,8 @@ then read the `color_data` values.
 
 .. code:: python3
 
+    import time
+
     apds.enable_color = True
 
     while True:
